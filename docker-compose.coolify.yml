@@ -1,0 +1,175 @@
+# Worklenz für Coolify
+# - Kein eigenes SSL: TLS macht Coolifys Proxy (Traefik)
+# - nginx verteilt intern auf Frontend / Backend / Datei-Speicher
+# - In Coolify NUR dem Service "nginx" eine Domain geben (z. B. https://pm.deine-domain.de)
+
+services:
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    depends_on:
+      - frontend
+      - backend
+      - seaweedfs
+    volumes:
+      - ./nginx/coolify.conf:/etc/nginx/conf.d/default.conf:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  frontend:
+    image: chamikajaycey/worklenz-frontend:3.4.2
+    restart: unless-stopped
+    depends_on:
+      - backend
+    environment:
+      VITE_API_URL: https://${APP_DOMAIN:?APP_DOMAIN setzen}
+      VITE_SOCKET_URL: wss://${APP_DOMAIN}
+      VITE_APP_TITLE: ${VITE_APP_TITLE:-Worklenz}
+      VITE_ENABLE_SURVEY_MODAL: "false"
+
+  backend:
+    image: chamikajaycey/worklenz-backend:3.4.2
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+      configure-seaweedfs:
+        condition: service_completed_successfully
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      TZ: ${TZ:-Europe/Berlin}
+      WORKLENZ_DEPLOYMENT_MODE: self_hosted
+      WORKLENZ_TELEMETRY_ENABLED: ${WORKLENZ_TELEMETRY_ENABLED:-false}
+
+      # URLs
+      FRONTEND_URL: https://${APP_DOMAIN}
+      SERVER_CORS: https://${APP_DOMAIN}
+      SOCKET_IO_CORS: https://${APP_DOMAIN}
+
+      # Datenbank
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_NAME: ${DB_NAME:-worklenz_db}
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD setzen}
+      DB_MAX_CLIENTS: 50
+      USE_PG_NATIVE: "false"
+
+      # Secrets (je: openssl rand -hex 32)
+      SESSION_SECRET: ${SESSION_SECRET:?SESSION_SECRET setzen}
+      COOKIE_SECRET: ${COOKIE_SECRET:?COOKIE_SECRET setzen}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET setzen}
+      SESSION_NAME: worklenz.sid
+
+      # Datei-Speicher (SeaweedFS, S3-kompatibel)
+      STORAGE_PROVIDER: s3
+      S3_BUCKET: ${S3_BUCKET:-worklenz-bucket}
+      S3_REGION: us-east-1
+      AWS_REGION: us-east-1
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-worklenz}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:?S3_SECRET_ACCESS_KEY setzen}
+      S3_ENDPOINT: http://seaweedfs:8333
+      S3_PUBLIC_URL: https://${APP_DOMAIN}/${S3_BUCKET:-worklenz-bucket}
+
+      # E-Mail (für Einladungen / Passwort-Reset)
+      EMAIL_PROVIDER: smtp
+      EMAIL_FROM: ${EMAIL_FROM:-Worklenz <noreply@example.com>}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_SECURE: ${SMTP_SECURE:-false}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      ENABLE_EMAIL_CRONJOBS: ${ENABLE_EMAIL_CRONJOBS:-false}
+
+      # Google-Login aus (sonst echte Werte eintragen)
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-disabled}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-disabled}
+      GOOGLE_CALLBACK_URL: https://${APP_DOMAIN}/secure/google/verify
+
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.41
+    restart: unless-stopped
+    command: ["mini", "-dir=/data"]
+    environment:
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-worklenz}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY}
+      S3_BUCKET: ${S3_BUCKET:-worklenz-bucket}
+    volumes:
+      - worklenz_seaweedfs_data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9333/cluster/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  configure-seaweedfs:
+    image: amazon/aws-cli:2.27.49
+    restart: on-failure
+    depends_on:
+      seaweedfs:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-worklenz}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY}
+      AWS_DEFAULT_REGION: us-east-1
+      S3_BUCKET: ${S3_BUCKET:-worklenz-bucket}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        if ! aws --endpoint-url http://seaweedfs:8333 s3api create-bucket --bucket "$${S3_BUCKET}"; then
+          aws --endpoint-url http://seaweedfs:8333 s3api head-bucket --bucket "$${S3_BUCKET}"
+        fi
+    exclude_from_hc: true
+
+  db:
+    image: postgres:15
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_DB: ${DB_NAME:-worklenz_db}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d ${DB_NAME:-worklenz_db} -U ${DB_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - worklenz_postgres_data:/var/lib/postgresql/data
+      # Schema wird beim ERSTEN Start aus dem Repo eingespielt
+      - ./worklenz-backend/database/sql:/docker-entrypoint-initdb.d/sql:ro
+      - ./worklenz-backend/database/00_init.sh:/docker-entrypoint-initdb.d/00_init.sh:ro
+
+  db-backup:
+    image: postgres:15
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_DB: ${DB_NAME:-worklenz_db}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - worklenz_pg_backups:/pg_backups
+    command: >
+      bash -c 'while true; do
+        sleep 86400;
+        f=/pg_backups/worklenz_db_$$(date +%Y-%m-%d_%H-%M-%S).sql;
+        if PGPASSWORD="$$POSTGRES_PASSWORD" pg_dump -h db -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" > "$$f.tmp" && mv "$$f.tmp" "$$f"; then
+          find /pg_backups -type f -name "*.sql" -mtime +30 -delete;
+        else
+          rm -f "$$f.tmp"; echo "Backup fehlgeschlagen" >&2;
+        fi;
+      done'
+
+volumes:
+  worklenz_postgres_data:
+  worklenz_seaweedfs_data:
+  worklenz_pg_backups:
